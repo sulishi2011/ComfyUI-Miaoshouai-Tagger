@@ -80,41 +80,103 @@ class Tagger:
     FUNCTION = "start_tag"
     CATEGORY = "MiaoshouAI Tagger"
 
+    def patch_florence2_for_transformers_compatibility(self, model):
+        """
+        动态修补 Florence2 模型以兼容新版 transformers
+        为模型类添加缺失的 attention 相关属性
+        """
+        model_class = model.__class__
+
+        # 检查并添加 _supports_sdpa 属性
+        if not hasattr(model_class, '_supports_sdpa'):
+            print(f"Patching {model_class.__name__} with _supports_sdpa=True for transformers compatibility")
+            model_class._supports_sdpa = True
+
+        # 添加其他可能缺失的 attention 相关属性
+        if not hasattr(model_class, '_supports_flash_attn_2'):
+            model_class._supports_flash_attn_2 = False
+
+        if not hasattr(model_class, '_supports_sdpa_4d_causal_mask'):
+            model_class._supports_sdpa_4d_causal_mask = True
+
+        return model
+
     def get_model_and_processor(self, model_name, attention, device, dtype):
         """获取模型和处理器，如果缓存中没有则加载并缓存"""
         cache_key = f"{model_name}_{attention}_{str(dtype)}"
-        
+
         if cache_key not in self._model_cache:
             print(f"Loading model {model_name} for the first time...")
-            
+
             # 获取模型路径
             hg_model = 'MiaoshouAI/Florence-2-base-PromptGen-v2.0'
             if model_name == 'promptgen_large_v2.0':
                 hg_model = 'MiaoshouAI/Florence-2-large-PromptGen-v2.0'
             model_name_path = hg_model.rsplit('/', 1)[-1]
             model_path = os.path.join(folder_paths.models_dir, "LLM", model_name_path)
-            
+
             # 如果模型不存在则下载
             if not os.path.exists(model_path):
-                print(f"Downloading Lumina model to: {model_path}")
+                print(f"Downloading model to: {model_path}")
                 from huggingface_hub import snapshot_download
                 snapshot_download(repo_id=hg_model,
                                 local_dir=model_path,
                                 local_dir_use_symlinks=False)
 
-            # 加载模型和处理器
+            # 加载模型和处理器，带有向后兼容的 attention 实现
             with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports):
-                self._model_cache[cache_key] = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    attn_implementation=attention,
-                    device_map=device,
-                    torch_dtype=dtype,
-                    trust_remote_code=True
-                ).to(device)
-                self._processor_cache[cache_key] = AutoProcessor.from_pretrained(
-                    model_path,
-                    trust_remote_code=True
-                )
+                # 尝试不同的 attention 实现以确保向后兼容
+                model_loaded = False
+                attention_fallbacks = [attention, 'eager', None]
+
+                for attn_impl in attention_fallbacks:
+                    try:
+                        print(f"Attempting to load model with attention implementation: {attn_impl}")
+
+                        # 根据 attn_impl 准备参数
+                        model_kwargs = {
+                            "device_map": device,
+                            "torch_dtype": dtype,
+                            "trust_remote_code": True
+                        }
+
+                        # 只在 attn_impl 不为 None 时添加 attn_implementation 参数
+                        if attn_impl is not None:
+                            model_kwargs["attn_implementation"] = attn_impl
+
+                        loaded_model = AutoModelForCausalLM.from_pretrained(
+                            model_path,
+                            **model_kwargs
+                        ).to(device)
+
+                        # 动态修补模型以兼容新版 transformers
+                        loaded_model = self.patch_florence2_for_transformers_compatibility(loaded_model)
+
+                        self._model_cache[cache_key] = loaded_model
+                        self._processor_cache[cache_key] = AutoProcessor.from_pretrained(
+                            model_path,
+                            trust_remote_code=True
+                        )
+
+                        print(f"Model loaded successfully with attention implementation: {attn_impl}")
+                        model_loaded = True
+                        break
+
+                    except (AttributeError, ValueError, TypeError) as e:
+                        print(f"Failed to load with attention '{attn_impl}': {str(e)}")
+                        # 清理可能部分加载的模型
+                        if cache_key in self._model_cache:
+                            del self._model_cache[cache_key]
+                        if cache_key in self._processor_cache:
+                            del self._processor_cache[cache_key]
+                        continue
+
+                if not model_loaded:
+                    raise RuntimeError(
+                        "Failed to load model with any attention implementation. "
+                        "Please check your transformers library version and model compatibility."
+                    )
+
             print(f"Model loaded and cached with key: {cache_key}")
         else:
             print(f"Using cached model with key: {cache_key}")
