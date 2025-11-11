@@ -80,27 +80,6 @@ class Tagger:
     FUNCTION = "start_tag"
     CATEGORY = "MiaoshouAI Tagger"
 
-    def patch_florence2_for_transformers_compatibility(self, model):
-        """
-        动态修补 Florence2 模型以兼容新版 transformers
-        为模型类添加缺失的 attention 相关属性
-        """
-        model_class = model.__class__
-
-        # 检查并添加 _supports_sdpa 属性
-        if not hasattr(model_class, '_supports_sdpa'):
-            print(f"Patching {model_class.__name__} with _supports_sdpa=True for transformers compatibility")
-            model_class._supports_sdpa = True
-
-        # 添加其他可能缺失的 attention 相关属性
-        if not hasattr(model_class, '_supports_flash_attn_2'):
-            model_class._supports_flash_attn_2 = False
-
-        if not hasattr(model_class, '_supports_sdpa_4d_causal_mask'):
-            model_class._supports_sdpa_4d_causal_mask = True
-
-        return model
-
     def get_model_and_processor(self, model_name, attention, device, dtype):
         """获取模型和处理器，如果缓存中没有则加载并缓存"""
         cache_key = f"{model_name}_{attention}_{str(dtype)}"
@@ -144,15 +123,10 @@ class Tagger:
                         if attn_impl is not None:
                             model_kwargs["attn_implementation"] = attn_impl
 
-                        loaded_model = AutoModelForCausalLM.from_pretrained(
+                        self._model_cache[cache_key] = AutoModelForCausalLM.from_pretrained(
                             model_path,
                             **model_kwargs
                         ).to(device)
-
-                        # 动态修补模型以兼容新版 transformers
-                        loaded_model = self.patch_florence2_for_transformers_compatibility(loaded_model)
-
-                        self._model_cache[cache_key] = loaded_model
                         self._processor_cache[cache_key] = AutoProcessor.from_pretrained(
                             model_path,
                             trust_remote_code=True
