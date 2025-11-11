@@ -6,4 +6,7 @@ __pycache__
 *.bak
 checkpoints
 results
-backup
+backup__pycache__/
+.ipynb_checkpoints/
+*.pyc
+nodes-backup.py
