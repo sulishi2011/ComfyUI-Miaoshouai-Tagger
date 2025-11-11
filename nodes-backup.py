@@ -11,7 +11,6 @@ import comfy.model_management as mm
 from comfy.utils import ProgressBar
 import folder_paths
 import random
-import string
 
 def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
     if not str(filename).endswith("modeling_florence2.py"):
@@ -26,9 +25,6 @@ def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
 
 
 class Tagger:
-    # 添加类级别的缓存字典
-    _model_cache = {}
-    _processor_cache = {}
 
     def __init__(self):
         pass
@@ -41,7 +37,7 @@ class Tagger:
                     "default": "promptgen_base_v2.0"
                 }),
                 "folder_path": ("STRING", {
-                    "multiline": False,
+                    "multiline": False,  # True if you want the field to look like the one on the ClipTextEncode node
                     "default": "Path to your image folder"
                 }),
                 "caption_method": (['tags', 'simple', 'detailed', 'extra', 'mixed', 'extra_mixed', 'analyze'], {
@@ -49,12 +45,10 @@ class Tagger:
                 }),
                 "max_new_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096}),
                 "num_beams": ("INT", {"default": 4, "min": 1, "max": 64}),
-                "seed": ("INT", {  # 替换 random_prompt 为 seed
-                    "default": 0,
-                    "min": 0,
-                    "max": 0xffffffffffffffff
+                "random_prompt": (['never', 'always'], {
+                    "default": "never"
                 })
-            },
+        },
             "optional": {
                 "images": ("IMAGE",),
                 "filenames": ("STRING", {"forceInput": True}),
@@ -78,49 +72,9 @@ class Tagger:
     RETURN_NAMES = ("images", "filenames", "captions", "folder_path", "batch_size", )
     OUTPUT_IS_LIST = (True, True, True, False, False, )
     FUNCTION = "start_tag"
+    #OUTPUT_NODE = True
     CATEGORY = "MiaoshouAI Tagger"
 
-    def get_model_and_processor(self, model_name, attention, device, dtype):
-        """获取模型和处理器，如果缓存中没有则加载并缓存"""
-        cache_key = f"{model_name}_{attention}_{str(dtype)}"
-        
-        if cache_key not in self._model_cache:
-            print(f"Loading model {model_name} for the first time...")
-            
-            # 获取模型路径
-            hg_model = 'MiaoshouAI/Florence-2-base-PromptGen-v2.0'
-            if model_name == 'promptgen_large_v2.0':
-                hg_model = 'MiaoshouAI/Florence-2-large-PromptGen-v2.0'
-            model_name_path = hg_model.rsplit('/', 1)[-1]
-            model_path = os.path.join(folder_paths.models_dir, "LLM", model_name_path)
-            
-            # 如果模型不存在则下载
-            if not os.path.exists(model_path):
-                print(f"Downloading Lumina model to: {model_path}")
-                from huggingface_hub import snapshot_download
-                snapshot_download(repo_id=hg_model,
-                                local_dir=model_path,
-                                local_dir_use_symlinks=False)
-
-            # 加载模型和处理器
-            with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports):
-                self._model_cache[cache_key] = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    attn_implementation=attention,
-                    device_map=device,
-                    torch_dtype=dtype,
-                    trust_remote_code=True
-                ).to(device)
-                self._processor_cache[cache_key] = AutoProcessor.from_pretrained(
-                    model_path,
-                    trust_remote_code=True
-                )
-            print(f"Model loaded and cached with key: {cache_key}")
-        else:
-            print(f"Using cached model with key: {cache_key}")
-
-        return self._model_cache[cache_key], self._processor_cache[cache_key]
-    
     def tag_image(self, image, caption_method, model, processor, device, dtype, max_new_tokens, do_sample, num_beams):
 
         if caption_method == 'tags':
@@ -155,8 +109,7 @@ class Tagger:
 
         return parsed_answer[prompt]
 
-    def start_tag(self, model, folder_path, caption_method, max_new_tokens, num_beams, seed, images=None, filenames=None, captions=None, prefix_caption="", suffix_caption="", replace_tags=""):
-
+    def start_tag(self, model, folder_path, caption_method, max_new_tokens, num_beams, random_prompt, images=None, filenames=None, captions=None, prefix_caption="", suffix_caption="", replace_tags=""):
         file_names = []
         tag_contents = []
         pil_images = []
@@ -164,23 +117,32 @@ class Tagger:
         attention = 'sdpa'
         precision = 'fp16'
 
-        # 设置随机种子
-        if seed != 0:
-            random.seed(seed)
-            torch.manual_seed(seed)
-            # 设置随机采样
-            do_sample = True
-        else:
-            do_sample = False
-        
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
-        # 使用缓存获取模型和处理器
-        model, processor = self.get_model_and_processor(model, attention, device, dtype)
+        # Download model if it does not exist
 
-        # 处理图片部分保持不变
+        hg_model = 'MiaoshouAI/Florence-2-base-PromptGen-v2.0'
+        if model == 'promptgen_large_v2.0':
+            hg_model = 'MiaoshouAI/Florence-2-large-PromptGen-v2.0'
+        model_name = hg_model.rsplit('/', 1)[-1]
+        model_path = os.path.join(folder_paths.models_dir, "LLM", model_name)
+        if not os.path.exists(model_path):
+            print(f"Downloading Lumina model to: {model_path}")
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=hg_model,
+                              local_dir=model_path,
+                              local_dir_use_symlinks=False)
+
+        with patch("transformers.dynamic_module_utils.get_imports",
+                   fixed_get_imports):  # workaround for unnecessary flash_attn requirement
+            model = AutoModelForCausalLM.from_pretrained(model_path, attn_implementation=attention, device_map=device,
+                                                         torch_dtype=dtype, trust_remote_code=True).to(device)
+
+        # Load the processor
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+
         if images is None:
             for filename in os.listdir(folder_path):
                 image_types = ['png', 'jpg', 'jpeg']
@@ -223,6 +185,11 @@ class Tagger:
 
         pbar = ProgressBar(len(pil_images))
 
+        if random_prompt == 'always':
+            do_sample = True
+        else:
+            do_sample = False
+
         for i, image in enumerate(pil_images):
             tags = self.tag_image(image, caption_method, model, processor, device, dtype, max_new_tokens, do_sample, num_beams)
             if "eg:" not in replace_tags and ":" in replace_tags:
@@ -254,17 +221,13 @@ class Tagger:
         This method is used in the core repo for the LoadImage node where they return the image hash as a string, if the image hash
         changes between executions the LoadImage node is executed again.
     """
-    @classmethod 
-    def IS_CHANGED(s, model, folder_path, caption_method, max_new_tokens, num_beams, seed, images=None, filenames=None, captions=None, prefix_caption="", suffix_caption="", replace_tags=""):
-        return str(seed)  # 直接返回种子值，种子变化时重新执行
-
     @classmethod
-    def clear_cache(cls):
-        """清理模型缓存的方法"""
-        print("Clearing model cache...")
-        cls._model_cache.clear()
-        cls._processor_cache.clear()
-        
+    def IS_CHANGED(s, model, folder_path, caption_method, max_new_tokens, num_beams, random_prompt, images=None, filenames=None, captions=None, prefix_caption="", suffix_caption="", replace_tags=""):
+
+        if random_prompt == 'always':
+            return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+        return ''
+
 class SaveTags:
     def __init__(self):
         pass
